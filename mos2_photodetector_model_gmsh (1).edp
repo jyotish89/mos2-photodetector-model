@@ -1,0 +1,527 @@
+// ============================================================================
+//  Numerical Modeling and Optimization of the Photoresponse of a Monolayer
+//  MoS2 Photodetector -- FreeFEM++ port of the Python/SciPy notebook model
+// ============================================================================
+//
+//  This is a genuine finite-element re-implementation (not a translation of
+//  solve_bvp calls) of the same physics as the notebook:
+//
+//    Electrons:  0 = Dn*d2n/dx2 - mu_n*E*dn/dx - (n-n0)/tau_n + G
+//    Holes:      0 = Dp*d2p/dx2 + mu_p*E*dp/dx - (p-p0)/tau_p + G
+//    Einstein relation: D = mu*kB*T/q ,  uniform lateral field E = V/L
+//
+//  solved for the EXCESS carrier density (u = n - n0, or p - p0), with
+//  Dirichlet (ohmic contact) boundary conditions u = 0 at both contacts,
+//  exactly as in the notebook's solve_bvp formulation.
+//
+//  FreeFEM's mesh generator is fundamentally 2D/3D, so the 1D channel is
+//  represented as a thin 2D strip [0,L] x [0,H] with H << L ("1D-equivalent
+//  strip" trick). Neumann (natural / do-nothing) conditions on the top and
+//  bottom edges, combined with a forcing term that has no y-dependence,
+//  guarantee the solution is exactly uniform in y -- i.e. the FE solution
+//  on the strip IS the 1D solution, just carried by a 2D mesh. This is the
+//  standard way to solve 1D BVPs in FreeFEM.
+//
+//  Run with:   FreeFem++ mos2_photodetector_model.edp
+//  (or FreeFem++-nw for headless / no graphics)
+//
+//  Output: several CSV files (bias sweep, wavelength sweep, heatmap) plus a
+//  summary.txt, written next to this script, so the numbers can be plotted
+//  with Python/gnuplot/Excel exactly like the notebook figures.
+// ============================================================================
+
+
+// ============================================================================
+// SECTION 1: PARAMETERS  (mirrors notebook initialize_parameters())
+// ============================================================================
+
+// ---- physical constants (exact, SI) ---------------------------------------
+real q  = 1.602176634e-19;      // C
+real kB = 1.380649e-23;         // J/K
+real hP = 6.62607015e-34;       // J s   (named hP to avoid clashing with mesh height H)
+real c0 = 2.99792458e8;         // m/s
+
+// ---- operating condition ---------------------------------------------------
+real T = 300.0;                 // K, room temperature
+
+// ---- (A) literature-supported MoS2 values ----------------------------------
+real EgEV              = 1.8;     // optical bandgap, eV
+real lambdaExcitonNm   = 600.0;   // excitonic/optical absorption feature, nm
+real bondLengthMoSAng  = 2.409;   // Mo-S bond length, Angstrom (documentation only)
+
+// ---- (B) PARAMETERS REQUIRING LITERATURE VERIFICATION ----------------------
+// Transport
+real muNcm2Vs = 30.0;    // electron mobility, cm^2/(V s)      REQUIRES LITERATURE VERIFICATION
+real muPcm2Vs = 15.0;    // hole mobility, cm^2/(V s)          REQUIRES LITERATURE VERIFICATION
+real tauN     = 1.0e-9;  // electron excess-carrier lifetime,s REQUIRES LITERATURE VERIFICATION
+real tauP     = 1.0e-9;  // hole excess-carrier lifetime, s    REQUIRES LITERATURE VERIFICATION
+
+// Geometry
+real thicknessNm = 0.65;   // monolayer thickness, nm            REQUIRES LITERATURE VERIFICATION
+real LchannelUm  = 1.0;    // source-drain channel length, um    REQUIRES LITERATURE VERIFICATION
+real WchannelUm  = 5.0;    // channel width, um                  REQUIRES LITERATURE VERIFICATION
+
+// Optical response
+real absorbanceBase  = 0.07;  // baseline absorbed fraction          REQUIRES LITERATURE VERIFICATION
+real excitonEnh      = 1.5;   // peak absorbance multiplier at exciton REQUIRES LITERATURE VERIFICATION
+real excitonWidthNm  = 25.0;  // Gaussian width of exciton feature, nm REQUIRES LITERATURE VERIFICATION
+real IQE              = 0.8;  // internal quantum efficiency          REQUIRES LITERATURE VERIFICATION
+
+// Equilibrium (dark) sheet carrier densities (monolayer MoS2 is typically
+// weakly n-type from sulfur-vacancy donors, so p0 << n0)
+real nS0m2 = 1.0e16;   // equilibrium sheet electron density, m^-2   REQUIRES LITERATURE VERIFICATION
+real pS0m2 = 1.0e12;   // equilibrium sheet hole density, m^-2       REQUIRES LITERATURE VERIFICATION
+
+// ---- numerics ----------------------------------------------------------------
+int Nx = 100;    // elements along the channel (x), matches notebook N_grid
+int Ny = 3;       // elements across the artificial strip thickness (y)
+
+// ---- derived quantities (SI) --------------------------------------------------
+real Lm = LchannelUm * 1e-6;
+real Wm = WchannelUm * 1e-6;
+real tm = thicknessNm * 1e-9;
+real Hm = Lm / 20.0;             // artificial strip height for the 2D->1D mesh trick
+
+real muN = muNcm2Vs * 1e-4;      // m^2/(V s)
+real muP = muPcm2Vs * 1e-4;      // m^2/(V s)
+
+real DN = muN * kB * T / q;      // Einstein relation, m^2/s
+real DP = muP * kB * T / q;
+
+real n0 = nS0m2 / tm;            // m^-3
+real p0 = pS0m2 / tm;            // m^-3
+
+cout << "Derived quantities (SI units):" << endl;
+cout << "  mu_n = " << muN << "   mu_p = " << muP << endl;
+cout << "  D_n  = " << DN  << "   D_p  = " << DP  << endl;
+cout << "  n0   = " << n0  << "   p0   = " << p0  << endl;
+cout << "  L_m  = " << Lm  << "   W_m  = " << Wm  << "   t_m = " << tm << endl;
+
+
+// ============================================================================
+// SECTION 2: OPTICS  -  photon energy, spectral absorbance, generation rate
+// (mirrors notebook calculate_photon_energy / spectral_absorbance /
+//  calculate_generation_rate)
+// ============================================================================
+
+func real photonEnergyJ(real wlNm)
+{
+    return hP * c0 / (wlNm * 1e-9);
+}
+
+func real photonEnergyEV(real wlNm)
+{
+    return photonEnergyJ(wlNm) / q;
+}
+
+func real spectralAbsorbance(real wlNm)
+{
+    real EeV = photonEnergyEV(wlNm);
+    real bump = (excitonEnh - 1.0) * exp(-0.5 * ((wlNm - lambdaExcitonNm) / excitonWidthNm)^2);
+    real A = absorbanceBase * (1.0 + bump);
+    if (EeV < EgEV) A = 0.0;     // sub-gap photons: negligible absorption
+    return A;
+}
+
+func real generationRate(real PoptW, real wlNm)
+{
+    // Spatially-uniform photogeneration rate G0 [m^-3 s^-1]. The monolayer
+    // is optically thin (thickness << absorption length), so generation is
+    // treated as uniform through the thickness and along the channel.
+    real Ephoton   = photonEnergyJ(wlNm);
+    real illumArea = Lm * Wm;
+    real intensity = PoptW / illumArea;          // W/m^2
+    real photonFlux = intensity / Ephoton;        // photons/(m^2 s)
+    real A = spectralAbsorbance(wlNm);
+    real absorbedFlux = photonFlux * A;           // photons absorbed/(m^2 s)
+    real G0loc = IQE * absorbedFlux / tm;         // m^-3 s^-1
+    return G0loc;
+}
+
+
+// ============================================================================
+// SECTION 3: MESH + TRANSPORT  -  steady-state drift-diffusion FE solve
+// (mirrors notebook solve_transport(), but as a genuine FEM weak form
+//  instead of solve_bvp)
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// MESH: now imported from Gmsh instead of FreeFEM's built-in square().
+//
+// The mesh is generated externally from mos2_photodetector.geo (Source/
+// Drain/Top/Bottom/MoS2 geometry, adjustable mesh-size parameter, local
+// refinement near the Source and Drain contacts) and exported as
+// mos2_mesh.msh (Gmsh legacy ASCII format 2.2 -- required by gmshload()).
+//
+// The Physical Group tags in the .geo file were deliberately chosen to
+// reproduce the SAME numbering the old square() mesh used, so every
+// boundary condition below -- on(2,4, un=0), on(2,4, up=0) -- is UNCHANGED:
+//   Physical Line("Bottom",1) -> y=0     Physical Line("Drain", 2) -> x=L
+//   Physical Line("Top",   3) -> y=H     Physical Line("Source",4) -> x=0
+//   Physical Surface("MoS2",1) -> whole channel region
+//
+// NOTE: Nx, Ny (element counts) are no longer used to build Th -- mesh
+// density is now controlled entirely by lc_factor in the .geo file (coarse
+// / medium / fine). They are left defined above only because nothing else
+// in this script depends on removing them.
+mesh Th = gmshload("mos2_mesh.msh");
+
+fespace Vh(Th, P1);
+Vh un, vn;     // electron excess density (delta_n) and test function
+Vh up, vp;     // hole excess density (delta_p) and test function
+
+real Efield = 0.0;   // uniform lateral field E = V/L, updated before each solve
+real G0     = 0.0;   // photogeneration rate, updated before each solve
+
+// Weak forms, derived by multiplying the strong-form ODE by a test function
+// and integrating by parts (boundary term vanishes because v=0 at the
+// Dirichlet contacts). Full 2D Laplacian is used for robustness; since G0
+// and the boundary data have no y-dependence, the FE solution is exactly
+// uniform in y regardless.
+//
+//   electrons: Dn*int(u'v') + mu_n*E*int(u'v) + (1/tau_n)*int(uv) = int(G0 v)
+//   holes    : Dp*int(u'v') - mu_p*E*int(u'v) + (1/tau_p)*int(uv) = int(G0 v)
+
+problem electronPDE(un, vn) =
+      int2d(Th)( DN*(dx(un)*dx(vn) + dy(un)*dy(vn))
+                 + muN*Efield*dx(un)*vn
+                 + (1.0/tauN)*un*vn )
+    - int2d(Th)( G0*vn )
+    + on(2, 4, un = 0);
+
+problem holePDE(up, vp) =
+      int2d(Th)( DP*(dx(up)*dx(vp) + dy(up)*dy(vp))
+                 - muP*Efield*dx(up)*vp
+                 + (1.0/tauP)*up*vp )
+    - int2d(Th)( G0*vp )
+    + on(2, 4, up = 0);
+
+
+// ============================================================================
+// SECTION 4: CURRENT  (mirrors notebook calculate_current())
+//
+//   Jn = q( mu_n * n * E + Dn * dn/dx )
+//   Jp = q( mu_p * p * E - Dp * dp/dx )
+//
+// Averaged over the channel (area-average over the strip == x-average,
+// since the FE solution has no y-dependence) and converted to a terminal
+// current using the physical cross-section W_m * t_m.
+// ============================================================================
+
+func real solveDevice(real Vbias, real G0val)
+{
+    // Solves electron + hole PDEs at the given bias/generation and returns
+    // the terminal current I_total [A].
+    Efield = Vbias / Lm;
+    G0 = G0val;
+    electronPDE;
+    holePDE;
+
+    real areaStrip = Lm * Hm;
+    real JnAvg = int2d(Th)( q*(muN*(n0+un)*Efield + DN*dx(un)) ) / areaStrip;
+    real JpAvg = int2d(Th)( q*(muP*(p0+up)*Efield - DP*dx(up)) ) / areaStrip;
+
+    real crossSectionArea = Wm * tm;
+    return (JnAvg + JpAvg) * crossSectionArea;
+}
+
+
+// ============================================================================
+// SECTION 5: SIMULATION DRIVER
+// (mirrors notebook run_simulation() / calculate_responsivity())
+// ============================================================================
+
+real gIdark, gIillum, gIphoto, gResp;   // outputs of runSimulation(), via side effect
+
+func bool runSimulation(real Vbias, real PoptW, real wlNm)
+{
+    real G0illum = generationRate(PoptW, wlNm);
+    gIillum = solveDevice(Vbias, G0illum);
+    gIdark  = solveDevice(Vbias, 0.0);
+    gIphoto = gIillum - gIdark;
+    gResp   = (PoptW > 0.0) ? gIphoto / PoptW : 0.0;
+    return true;
+}
+
+
+// ============================================================================
+// Demonstration and results (mirrors the notebook's "Demonstration and
+// Results" section, cells 19-34)
+// ============================================================================
+
+real Vdemo  = 1.0;      // V, applied bias
+real Pdemo  = 1e-6;     // W, incident optical power (1 uW)
+real wlDemo = 600.0;    // nm, wavelength (at the excitonic feature)
+
+runSimulation(Vdemo, Pdemo, wlDemo);
+
+// gIdark/gIillum/gIphoto/gResp are reused (overwritten) by every later call
+// to runSimulation()/solveDevice() in the sweeps and optimization below, so
+// the demo-point results are copied into their own variables here for the
+// final summary.
+real demoIdark = gIdark, demoIillum = gIillum, demoIphoto = gIphoto, demoResp = gResp;
+
+cout << endl << "=== Demo operating point (V=" << Vdemo << " V, P=" << Pdemo
+     << " W, lambda=" << wlDemo << " nm) ===" << endl;
+cout << "Dark current        I_dark  = " << demoIdark  << " A" << endl;
+cout << "Illuminated current I_illum = " << demoIillum << " A" << endl;
+cout << "Photocurrent        I_photo = " << demoIphoto << " A" << endl;
+cout << "Responsivity        R       = " << demoResp   << " A/W" << endl;
+
+// on-screen carrier-profile plots (electron/hole excess density at the demo
+// point); comment out if running FreeFem++-nw (headless)
+plot(un, value=true, fill=true, cmm="Electron excess density delta_n(x) [m^-3], illuminated");
+plot(up, value=true, fill=true, cmm="Hole excess density delta_p(x) [m^-3], illuminated");
+
+// NOTE: runSimulation() above solves illuminated THEN dark internally, so
+// un/up currently hold the DARK solution, not illuminated -- each case is
+// explicitly re-solved and sampled right away below (rather than trusting
+// whatever solve happened to run last) to avoid mixing the two up, so both
+// profiles can be written to the same CSV for a dark-vs-illuminated overlay
+// (mirrors the notebook's plot_dark_vs_illum()).
+
+int Nprofile = 400;
+real[int] dnIllumArr(Nprofile+1), dpIllumArr(Nprofile+1);
+real[int] dnDarkArr(Nprofile+1),  dpDarkArr(Nprofile+1);
+
+real G0demo = generationRate(Pdemo, wlDemo);
+
+Efield = Vdemo / Lm;
+G0 = G0demo;
+electronPDE;
+holePDE;
+for (int i = 0; i <= Nprofile; i++)
+{
+    real xx = Lm * i / Nprofile;
+    real yy = Hm / 2.0;               // any y works: solution is y-uniform
+    dnIllumArr[i] = un(xx, yy);
+    dpIllumArr[i] = up(xx, yy);
+}
+
+Efield = Vdemo / Lm;
+G0 = 0.0;
+electronPDE;
+holePDE;
+for (int i = 0; i <= Nprofile; i++)
+{
+    real xx = Lm * i / Nprofile;
+    real yy = Hm / 2.0;
+    dnDarkArr[i] = un(xx, yy);
+    dpDarkArr[i] = up(xx, yy);
+}
+
+{
+    ofstream fdemo("demo_profile.csv");
+    fdemo << "x_um,delta_n_illum,delta_p_illum,n_illum,p_illum,"
+          << "delta_n_dark,delta_p_dark,n_dark,p_dark" << endl;
+    for (int i = 0; i <= Nprofile; i++)
+    {
+        real xx = Lm * i / Nprofile;
+        real dnIllum = dnIllumArr[i], dpIllum = dpIllumArr[i];
+        real dnDark  = dnDarkArr[i],  dpDark  = dpDarkArr[i];
+        fdemo << xx*1e6 << "," << dnIllum << "," << dpIllum << ","
+              << (dnIllum+n0) << "," << (dpIllum+p0) << ","
+              << dnDark << "," << dpDark << ","
+              << (dnDark+n0) << "," << (dpDark+p0) << endl;
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// SECTION 6a: bias sweep  (mirrors notebook sweep_bias())
+// ----------------------------------------------------------------------------
+
+int NV = 15;
+real Vmin = 0.05, Vmax = 3.0;
+
+{
+    ofstream fbias("bias_sweep.csv");
+    fbias << "V_bias,I_dark,I_illum,I_photo,responsivity" << endl;
+    for (int i = 0; i < NV; i++)
+    {
+        real V = Vmin + (Vmax - Vmin) * i / (NV - 1);
+        runSimulation(V, Pdemo, wlDemo);
+        fbias << V << "," << gIdark << "," << gIillum << "," << gIphoto << "," << gResp << endl;
+    }
+}
+cout << "Wrote bias_sweep.csv" << endl;
+
+
+// ----------------------------------------------------------------------------
+// SECTION 6b: optical power sweep  (mirrors notebook sweep_power())
+// ----------------------------------------------------------------------------
+
+int NP = 15;
+real Pmin = 0.1e-6, Pmax = 10e-6;
+
+{
+    ofstream fpower("power_sweep.csv");
+    fpower << "P_opt_W,I_dark,I_illum,I_photo,responsivity" << endl;
+    real IdarkRef = solveDevice(Vdemo, 0.0);   // dark reference current at V=Vdemo
+    for (int i = 0; i < NP; i++)
+    {
+        real P = Pmin + (Pmax - Pmin) * i / (NP - 1);
+        real G0illum = generationRate(P, wlDemo);
+        real Iillum = solveDevice(Vdemo, G0illum);
+        real Iphoto = Iillum - IdarkRef;
+        real Resp = (P > 0.0) ? Iphoto / P : 0.0;
+        fpower << P << "," << IdarkRef << "," << Iillum << "," << Iphoto << "," << Resp << endl;
+    }
+}
+cout << "Wrote power_sweep.csv" << endl;
+
+
+// ----------------------------------------------------------------------------
+// SECTION 6c: wavelength sweep  (mirrors notebook sweep_wavelength())
+// ----------------------------------------------------------------------------
+
+int Nwl = 20;
+real wlMin = 450.0, wlMax = 700.0;
+
+{
+    ofstream fwl("wavelength_sweep.csv");
+    fwl << "wavelength_nm,I_dark,I_illum,I_photo,responsivity" << endl;
+    real IdarkRef = solveDevice(Vdemo, 0.0);
+    for (int i = 0; i < Nwl; i++)
+    {
+        real wl = wlMin + (wlMax - wlMin) * i / (Nwl - 1);
+        real G0illum = generationRate(Pdemo, wl);
+        real Iillum = solveDevice(Vdemo, G0illum);
+        real Iphoto = Iillum - IdarkRef;
+        real Resp = (Pdemo > 0.0) ? Iphoto / Pdemo : 0.0;
+        fwl << wl << "," << IdarkRef << "," << Iillum << "," << Iphoto << "," << Resp << endl;
+    }
+}
+cout << "Wrote wavelength_sweep.csv" << endl;
+
+
+// ----------------------------------------------------------------------------
+// SECTION 6d: 2D responsivity heatmap, wavelength x bias
+// (mirrors notebook responsivity_heatmap())
+// ----------------------------------------------------------------------------
+
+int NwlGrid = 14, NVgrid = 12;
+real wlGmin = 450.0, wlGmax = 700.0;
+real VGmin = 0.05, VGmax = 3.0;
+
+real[int,int] Rmatrix(NVgrid, NwlGrid);   // rows = bias, cols = wavelength
+
+{
+    ofstream fheat("heatmap.csv");
+    fheat << "V_bias,wavelength_nm,responsivity" << endl;
+    for (int iv = 0; iv < NVgrid; iv++)
+    {
+        real V = VGmin + (VGmax - VGmin) * iv / (NVgrid - 1);
+        real IdarkV = solveDevice(V, 0.0);
+        for (int iw = 0; iw < NwlGrid; iw++)
+        {
+            real wl = wlGmin + (wlGmax - wlGmin) * iw / (NwlGrid - 1);
+            real G0illum = generationRate(Pdemo, wl);
+            real Iillum = solveDevice(V, G0illum);
+            real R = (Pdemo > 0.0) ? (Iillum - IdarkV) / Pdemo : 0.0;
+            Rmatrix(iv, iw) = R;
+            fheat << V << "," << wl << "," << R << endl;
+        }
+    }
+}
+cout << "Wrote heatmap.csv (long format: V_bias, wavelength_nm, responsivity)" << endl;
+
+
+// ============================================================================
+// SECTION 7: OPTIMIZATION of photoresponse
+// (mirrors notebook optimize_photoresponse(): coarse grid seed, then a local
+//  refinement -- FreeFEM has no bundled L-BFGS-B, so refinement here is done
+//  with a shrinking-window grid search, which is the portable equivalent)
+// ============================================================================
+
+real Vlo = 0.05, Vhi = 3.0;
+real wlLo = 450.0, wlHi = 700.0;
+
+real bestR = -1.0e30, bestV = 0.0, bestWL = 0.0;
+
+// ---- stage 1: coarse 6x6 grid seed ----
+int Ncoarse = 6;
+for (int iv = 0; iv < Ncoarse; iv++)
+{
+    real V = Vlo + (Vhi - Vlo) * iv / (Ncoarse - 1);
+    real Idk = solveDevice(V, 0.0);
+    for (int iw = 0; iw < Ncoarse; iw++)
+    {
+        real wl = wlLo + (wlHi - wlLo) * iw / (Ncoarse - 1);
+        real G0illum = generationRate(Pdemo, wl);
+        real Iil = solveDevice(V, G0illum);
+        real R = (Iil - Idk) / Pdemo;
+        if (R > bestR) { bestR = R; bestV = V; bestWL = wl; }
+    }
+}
+
+// ---- stage 2-3: two rounds of shrinking-window refinement around the best
+//      point found so far (approximates a local optimizer) ----
+real windowV = (Vhi - Vlo) / Ncoarse;
+real windowWL = (wlHi - wlLo) / Ncoarse;
+int Nfine = 8;
+
+for (int refine = 0; refine < 2; refine++)
+{
+    real Vlo2  = max(Vlo,  bestV  - windowV);
+    real Vhi2  = min(Vhi,  bestV  + windowV);
+    real wlLo2 = max(wlLo, bestWL - windowWL);
+    real wlHi2 = min(wlHi, bestWL + windowWL);
+
+    for (int iv = 0; iv < Nfine; iv++)
+    {
+        real V = Vlo2 + (Vhi2 - Vlo2) * iv / (Nfine - 1);
+        real Idk = solveDevice(V, 0.0);
+        for (int iw = 0; iw < Nfine; iw++)
+        {
+            real wl = wlLo2 + (wlHi2 - wlLo2) * iw / (Nfine - 1);
+            real G0illum = generationRate(Pdemo, wl);
+            real Iil = solveDevice(V, G0illum);
+            real R = (Iil - Idk) / Pdemo;
+            if (R > bestR) { bestR = R; bestV = V; bestWL = wl; }
+        }
+    }
+    windowV  = windowV  / Nfine * 2.0;
+    windowWL = windowWL / Nfine * 2.0;
+}
+
+cout << endl << "=== Optimization result ===" << endl;
+cout << "Optimum bias:         V*  = " << bestV  << " V" << endl;
+cout << "Optimum wavelength:   lambda* = " << bestWL << " nm" << endl;
+cout << "Maximum responsivity: R*  = " << bestR  << " A/W" << endl;
+
+
+// ============================================================================
+// SECTION 8 (data export): summary file
+// (mirrors notebook's final summary table, cell 34)
+// ============================================================================
+
+{
+    ofstream fsum("summary.txt");
+    fsum << "MoS2 photodetector -- FreeFEM drift-diffusion model, summary" << endl;
+    fsum << "----------------------------------------------------------------" << endl;
+    fsum << "Dark current (V=" << Vdemo << " V)                 : " << demoIdark  << " A" << endl;
+    fsum << "Photocurrent (V=" << Vdemo << " V, P=" << Pdemo << " W, "
+         << wlDemo << " nm)  : " << demoIphoto << " A" << endl;
+    fsum << "Responsivity (same point)                         : " << demoResp   << " A/W" << endl;
+    fsum << "Optimum bias                                      : " << bestV   << " V" << endl;
+    fsum << "Optimum wavelength                                : " << bestWL  << " nm" << endl;
+    fsum << "Maximum responsivity (grid search)                : " << bestR   << " A/W" << endl;
+}
+cout << endl << "Wrote summary.txt, demo_profile.csv, bias_sweep.csv, power_sweep.csv, "
+     << "wavelength_sweep.csv, heatmap.csv" << endl;
+
+// ============================================================================
+// Notes and limitations (same as the notebook)
+// ============================================================================
+// - Decoupled drift-diffusion model: E = V/L is fixed (no self-consistent
+//   Poisson solve, no band bending / Schottky contacts).
+// - Linear excess-carrier recombination R = (carrier-equilibrium)/tau, not
+//   full Shockley-Read-Hall statistics with trap energies.
+// - Monolayer treated as an optically thin slab (uniform photogeneration
+//   through the 0.65 nm thickness), not a Beer-Lambert depth profile.
+// - Photoconductive gain (trap-mediated, responsivity >> 1 A/W reported in
+//   some experimental devices) is NOT included -- this captures primary
+//   photogeneration + drift-diffusion collection only.
+// - The 1D physics is carried on a thin 2D "strip" mesh purely as a FreeFEM
+//   meshing convenience; the solution is verified/guaranteed uniform in y.
